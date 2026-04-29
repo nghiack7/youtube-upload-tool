@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import time
+import json
 from pathlib import Path
 
 try:
@@ -19,6 +20,7 @@ try:
         QFormLayout,
         QGroupBox,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QListWidget,
@@ -101,6 +103,44 @@ def _load_credentials():
         return creds
 
     return None
+
+
+def _load_client_config() -> dict:
+    """Load OAuth client configuration from client_secrets.json."""
+    try:
+        with open(SECRETS_PATH, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except OSError as e:
+        raise ValueError(f"Could not read client_secrets.json: {e}") from e
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid client_secrets.json: {e}") from e
+
+    if not isinstance(config, dict):
+        raise ValueError("client_secrets.json must contain a JSON object.")
+    if "installed" in config or "web" in config:
+        return config
+    raise ValueError(
+        "client_secrets.json must contain either an 'installed' or 'web' OAuth client."
+    )
+
+
+def _select_manual_redirect_uri(client_config: dict) -> str:
+    """Pick a configured loopback redirect URI for manual copy/paste auth."""
+    section = client_config.get("web") or client_config.get("installed") or {}
+    redirect_uris = section.get("redirect_uris") or []
+
+    for prefix in ("http://127.0.0.1", "http://localhost"):
+        for uri in redirect_uris:
+            if isinstance(uri, str) and uri.startswith(prefix):
+                return uri
+
+    if "installed" in client_config:
+        return "http://127.0.0.1:8080/"
+
+    raise ValueError(
+        "Web OAuth client is missing a localhost/127.0.0.1 redirect URI. "
+        "Either add one in Google Cloud Console or create a Desktop app credential."
+    )
 
 
 class YouTubeUploaderThread(QThread):
@@ -745,6 +785,17 @@ class YouTubeUploaderApp(QMainWindow):
             webbrowser.open(url)
 
     def authenticate(self):
+        try:
+            client_config = _load_client_config()
+        except ValueError as e:
+            QMessageBox.critical(self, "Authentication Error", str(e))
+            self.check_auth_status()
+            return
+
+        if "web" in client_config:
+            self._authenticate_with_manual_callback(client_config)
+            return
+
         thread = AuthThread()
         thread.status.connect(self.auth_status_label.setText)
         thread.auth_success.connect(self._on_auth_success)
@@ -752,6 +803,75 @@ class YouTubeUploaderApp(QMainWindow):
         thread.finished.connect(self.check_auth_status)
         self._track_thread(thread)
         thread.start()
+
+    def _authenticate_with_manual_callback(self, client_config: dict) -> None:
+        try:
+            import google_auth_oauthlib.flow
+            import webbrowser
+
+            redirect_uri = _select_manual_redirect_uri(client_config)
+            flow = google_auth_oauthlib.flow.InstalledAppFlow.from_client_config(
+                client_config, SCOPES
+            )
+            flow.redirect_uri = redirect_uri
+            auth_url, _ = flow.authorization_url(
+                access_type="offline",
+                prompt="consent",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Authentication Error", str(e))
+            self.auth_status_label.setText("❌ Authentication setup failed")
+            return
+
+        self.auth_status_label.setText("🔑 Opening browser for authentication...")
+        webbrowser.open(auth_url)
+
+        instructions = (
+            "This OAuth file is a Web client, so the app cannot rely on an automatic "
+            "localhost callback.\n\n"
+            f"1. Sign in using the browser that just opened.\n"
+            f"2. After Google redirects to:\n   {redirect_uri}\n"
+            "   the page may fail to load. That is expected.\n"
+            "3. Copy the FULL URL from the browser address bar, or copy just the "
+            "authorization code.\n"
+            "4. Paste it below.\n\n"
+            f"If the browser did not open, use this URL manually:\n{auth_url}"
+        )
+        response, ok = QInputDialog.getMultiLineText(
+            self,
+            "Authenticate with YouTube",
+            instructions,
+        )
+        if not ok or not response.strip():
+            self.auth_status_label.setText("⚠️ Authentication cancelled")
+            return
+
+        pasted = response.strip()
+        if pasted.startswith("?"):
+            pasted = f"{redirect_uri.rstrip('/')}/{pasted}"
+
+        self.auth_status_label.setText("🔄 Exchanging authorization code...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            if pasted.startswith("http://") or pasted.startswith("https://"):
+                flow.fetch_token(authorization_response=pasted)
+            else:
+                flow.fetch_token(code=pasted)
+            _secure_write(TOKEN_PATH, flow.credentials.to_json())
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Authentication Error",
+                f"Authentication failed: {e}",
+            )
+            self.auth_status_label.setText("❌ Authentication failed")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self.auth_status_label.setText("✅ Authentication successful!")
+        self._on_auth_success()
+        self.check_auth_status()
 
     def _on_auth_success(self):
         QMessageBox.information(
